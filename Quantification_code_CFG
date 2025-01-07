@@ -1,0 +1,162 @@
+# import libraries
+import cv2 as cv
+from matplotlib import pyplot as plt
+import numpy as np
+import os, glob
+from google.colab import drive
+import csv
+
+drive.mount("/content/drive")
+root = '/content/drive/MyDrive/cellcounting1.7/'
+
+# directory struture should be as follows:
+#     /content/drive/MyDrive/cellcounting/IMAGE1/IMAGE1.tif
+#                                               /IMAGE1.txt
+#                                        /IMAGE2/IMAGE2.tif
+#                                               /IMAGE2.txt
+#                                        /...
+
+files_found = [os.path.relpath(f, root) for f in glob.glob(root+'*')]
+
+print(f'Found {len(files_found)} files in {root}:\n {[f for f in files_found]}')
+
+def read_ROI_from_txt(filename, px_to_inch=300):
+    '''
+    - get ROI coutour from .txt file exported from FIJI
+
+    filename: path of the .txt file with the ROI coordinates
+    px_to_inch: resolution of the microscope capture software
+
+    returns: array of x,y coordinates with shape (N, 0, 2)
+    '''
+    ROI = []
+    with open(filename, 'r') as text:
+        for line in text:
+            x, y = line.split()
+            coord = [[round(float(x) * px_to_inch), round(float(y) * px_to_inch)]]
+            # coord = [[int(np.floor(float(x))), int(np.floor(float(y)))]]
+            ROI.append(coord)
+    return np.array(ROI)
+
+
+def process_image(root, filename, blockSize=25, C=10, erosion_kernel_size=7,
+                  plot_processing=False, plot_final=True, save_final=True):
+
+    '''
+    - load image and txt from files
+    - process image to get coordinates of stained PV neurons
+    - export list of coordinates to .csv file
+    - optionally display and save plots
+
+    root: root for all files
+    filename: name of the file
+        directory struture should be as follows:
+            /content/drive/MyDrive/cellcounting1.7/IMAGE1/IMAGE1.tif
+                                                      /IMAGE1.txt
+                                               /IMAGE2/IMAGE2.tif
+                                                      /IMAGE2.txt
+                                               /...
+
+    blocksize: size in pixel of the sub-zone on
+               which we do the adaptive threshold mean
+    C: constant that is subtracted to each pixel in the
+               subzone, works with C~= blocksize/2
+    erosion_kernel_size: kernel size for erosion & dilation
+
+    returns: nothing
+    '''
+
+    # define paths
+    txt_path = root + filename + os.sep + filename + '.txt'
+    img_path = root + filename + os.sep + filename + '.tif'
+    output_csv = root + filename + os.sep + filename + '.csv'
+
+    # load image and ROI from file
+    image_full = cv.imread(img_path, cv.IMREAD_GRAYSCALE)
+    image_color = cv.cvtColor(image_full.copy(), cv.COLOR_GRAY2BGR)
+
+    # load ROI from file
+    ROI = read_ROI_from_txt(txt_path)
+
+    # draw ROI on color image
+    cv.drawContours(image_color, [ROI], -1, (0, 255, 0), 15)
+
+    # create mask to crop ROI area
+    mask = np.zeros(image_full.shape[:2], np.uint8)
+    mask = cv.drawContours(mask, [ROI], -1, 255, -1)
+
+    # crop ROI area from image_full
+    image_cropped = cv.bitwise_and(image_full, image_full, mask=mask)
+
+    # blur to remove noise
+    blurred = cv.GaussianBlur(image_cropped, (5, 5), 0)
+
+    # apply adaptive threshold.
+    thresh = cv.adaptiveThreshold(blurred, 255,
+                                  cv.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                  cv.THRESH_BINARY_INV,
+                                  blockSize=25, C=8)
+
+    # erode and dilate the thresholded image
+    s = 7
+    kernel = np.ones((s, s), np.uint8)
+    eroded = cv.erode(thresh, kernel)
+    dilated = cv.dilate(eroded, kernel)
+
+    # now compute the contour for each point in the eroded image
+    cnts, hierarchy = cv.findContours(dilated.copy(),
+                                      cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+
+    # loop through all contours found and draw them
+    # if area is bigger than MIN_AREA
+    # can play with MIN_AREA, 75 px seems to work
+    cells_on_image = 0
+    MIN_AREA = 50
+
+    with open(output_csv, 'w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow(["n", "x", "y"])
+        for c in cnts:
+            if cv.contourArea(c) > MIN_AREA:
+                # compute the center of the contour
+                M = cv.moments(c)
+                cX = int(M["m10"] / M["m00"])
+                cY = int(M["m01"] / M["m00"])
+
+                # check if center of contour is inside the ROI
+                # returns 1 if yes, -1 if NO, 0 if touching
+                res = cv.pointPolygonTest(ROI, (cX,cY), False)
+                if res == 1:
+                    # if inside ROI, draw in blue
+                    # increment counter
+                    cv.drawContours(image_color, [c], -1, (0, 0, 255), 2)
+                    cells_on_image += 1
+
+                    writer.writerow([cells_on_image, str(cX), str(cY)])
+
+                elif res == -1:
+                    # else draw in red
+                    cv.drawContours(image_color, [c], -1, (255, 0, 0), 2)
+
+    # plot processing steps
+    if plot_processing:
+        fig, axs = plt.subplots(1, 4, figsize=(20, 5))
+        axs[0].imshow(image_full)
+        axs[1].imshow(thresh)
+        axs[2].imshow(dilated)
+        axs[3].imshow(image_color)
+        for ax in axs.ravel():
+            ax.axis('off')
+
+    # plot final processed image
+    if plot_final:
+        plt.figure(figsize=(image_color.shape[0]/300, image_color.shape[1]/300))
+        plt.imshow(image_color)
+
+    # save plot to drive
+    if save_final:
+        savepath = root + filename + os.sep + filename + '_processed.png'
+        plt.imsave(savepath, image_color, dpi=300)
+
+
+    print(f'Found {cells_on_image} cells in image {filename}.')
